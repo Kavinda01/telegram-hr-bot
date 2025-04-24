@@ -1,0 +1,199 @@
+# A Telegram HR Recruitment Bot with Google Drive Upload and AI FAQ Support
+
+from flask import Flask, request
+import requests
+import os
+import json
+from datetime import datetime
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import openai
+
+app = Flask(__name__)
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/"
+
+GDRIVE_SECRET = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON")
+GDRIVE_FOLDER_ID = os.getenv("GDRIVE_FOLDER_ID")
+SERVICE_ACCOUNT_FILE = "service_account.json"
+SCOPES = ['https://www.googleapis.com/auth/drive.file']
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
+user_states = {}
+
+INTERVIEW_SCHEDULE = {
+    "101": {
+        "job_title": "Staff Nurse",
+        "date": "2025-04-28",
+        "time": "10:00 AM",
+        "location": "Nawaloka Hospital, Colombo",
+        "interviewer": "Ms. Perera (HR Manager)"
+    },
+    "102": {
+        "job_title": "HR Executive",
+        "date": "2025-04-29",
+        "time": "2:00 PM",
+        "location": "Nawaloka HR Office, Negombo",
+        "interviewer": "Mr. Fernando"
+    },
+    "103": {
+        "job_title": "Pharmacist",
+        "date": "2025-04-30",
+        "time": "11:00 AM",
+        "location": "Main Pharmacy, Colombo",
+        "interviewer": "Dr. Silva"
+    }
+}
+
+def upload_to_drive(local_path, file_name):
+    try:
+        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+            with open(SERVICE_ACCOUNT_FILE, "w") as f:
+                f.write(GDRIVE_SECRET)
+
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE, scopes=SCOPES
+        )
+        service = build('drive', 'v3', credentials=creds)
+
+        file_metadata = {
+            'name': file_name,
+            'parents': [GDRIVE_FOLDER_ID] if GDRIVE_FOLDER_ID else []
+        }
+        media = MediaFileUpload(local_path, mimetype='application/pdf')
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        ).execute()
+
+        file_id = file.get('id')
+        service.permissions().create(
+            fileId=file_id,
+            body={'type': 'anyone', 'role': 'reader'}
+        ).execute()
+
+        return f"https://drive.google.com/file/d/{file_id}/view"
+    except Exception as e:
+        print("Drive upload failed:", e)
+        return None
+
+def ask_openai(question):
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are an HR assistant for a hospital. Answer clearly and helpfully."},
+                {"role": "user", "content": question}
+            ],
+            max_tokens=200,
+            temperature=0.5
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print("OpenAI API error:", e)
+        return "I'm sorry, I'm currently unable to answer that. Please try again later."
+
+def handle_text(chat_id, user_id, user_name, message):
+    message_lower = message.lower()
+    if user_id not in user_states:
+        user_states[user_id] = {}
+
+    if "job opening" in message_lower or "vacancy" in message_lower:
+        user_states[user_id] = {"stage": "listing"}
+        return (
+            "📋 Current Job Openings:\n\n"
+            "🔹 Job ID 101: Staff Nurse (Colombo)\n"
+            "🔹 Job ID 102: HR Executive (Negombo)\n"
+            "🔹 Job ID 103: Pharmacist (Colombo)\n\n"
+            "Reply with 'apply for job id XXX' to upload your resume."
+        )
+
+    elif message_lower.startswith("apply") and "id" in message_lower:
+        job_id = ''.join(filter(str.isdigit, message))
+        user_states[user_id] = {"stage": "waiting_resume", "job_id": job_id}
+        return f"👍 You've chosen Job ID {job_id}. Please upload your resume in PDF format."
+
+    elif message_lower in ["hi", "hello", "start"]:
+        return (
+            "👋 Welcome to the HR Recruitment Assistant Bot!\n\n"
+            "You can ask me things like:\n"
+            "- 'What are the job openings?'\n"
+            "- 'Apply for Job ID 101'\n"
+            "- Upload your resume (PDF)\n"
+            "- Or ask any HR-related question."
+        )
+
+    else:
+        return ask_openai(message)
+
+@app.route(f"/{TELEGRAM_BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    data = request.get_json()
+    chat_id = data["message"]["chat"]["id"]
+    user_id = data["message"]["from"]["id"]
+    user_name = data["message"]["from"].get("first_name", "Candidate")
+
+    if "document" in data["message"] and user_states.get(user_id, {}).get("stage") == "waiting_resume":
+        file_id = data["message"]["document"]["file_id"]
+        file_name = data["message"]["document"]["file_name"]
+        job_id = user_states[user_id]["job_id"]
+
+        if not file_name.lower().endswith(".pdf"):
+            requests.post(TELEGRAM_API_URL, json={
+                "chat_id": chat_id,
+                "text": "⚠️ Please upload your resume in PDF format only."
+            })
+            return "ok"
+
+        file_info = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}").json()
+        file_path = file_info["result"]["file_path"]
+        file_url = f"{TELEGRAM_FILE_API}{file_path}"
+        file_content = requests.get(file_url).content
+
+        temp_path = f"/tmp/{file_name}"
+        with open(temp_path, "wb") as f:
+            f.write(file_content)
+
+        file_link = upload_to_drive(temp_path, file_name)
+        os.remove(temp_path)
+
+        if file_link:
+            confirmation = f"✅ Resume uploaded successfully.\n📄 View: {file_link}"
+        else:
+            confirmation = "⚠️ Failed to upload resume. Please try again later."
+
+        requests.post(TELEGRAM_API_URL, json={"chat_id": chat_id, "text": confirmation})
+
+        if job_id in INTERVIEW_SCHEDULE:
+            schedule = INTERVIEW_SCHEDULE[job_id]
+            interview_msg = (
+                f"📅 Interview Details:\n"
+                f"Position: {schedule['job_title']}\n"
+                f"Date: {schedule['date']} at {schedule['time']}\n"
+                f"Location: {schedule['location']}\n"
+                f"Contact: {schedule['interviewer']}"
+            )
+            requests.post(TELEGRAM_API_URL, json={"chat_id": chat_id, "text": interview_msg})
+
+        user_states[user_id]["stage"] = "done"
+
+    else:
+        message_text = data["message"].get("text", "")
+        reply = handle_text(chat_id, user_id, user_name, message_text)
+        requests.post(TELEGRAM_API_URL, json={"chat_id": chat_id, "text": reply})
+
+    return "ok"
+
+@app.route("/")
+def home():
+    return "✅ Telegram HR Bot with Google Drive + AI FAQ is running."
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
